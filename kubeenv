@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# Author: Ronald Silva
+# Description:
+#   Simulates virtual environments for kubectl by adding another level of abstraction / organization on top of Kubernetes contexts. Environments can contain multiple contexts.
+#   This is useful for cases where multiple environments are managed from a single host, compared to dedicated hosts for each environment where environment contexts would automatically be separated.   
+
+TMPDIR=$( mktemp -d )
+TRUE=0
+FALSE=1
+
+LOG_LEVELS=( 'TRACE 0' 'DEBUG 1' 'INFO 2' 'WARN 2' 'ERROR 3' )
+LOG_LEVEL_REGEX='^(TRACE|DEBUG|INFO|WARN|ERROR)$'
+LOG_LEVEL="ERROR"
+
+KUBEENV_CONF_DIR="${KUBEENV_CONF_DIR:-${HOME}/.kube/kubeenv}"
+
+# Clean up temporary files on exit.
+trap "rm -rf ${TMPDIR}" EXIT
+
+#############################
+#           Usage           #
+#############################
+
+usage() {
+    cat << EOF
+USAGE:
+  kubeenv                                    : list the environments
+  kubeenv <NAME>                             : switch to environment <NAME>
+  kubeenv -c, --current                      : show the current environment name
+  kubeenv -a <NAME> [<NAME>...]              : add new environment with name <NAME>
+  kubeenv -i [<KUBECONFIG>]                  : import all contexts as environments
+  kubeenv -i <NAME> <CONTEXT> [<KUBECONFIG>] : import context <CONTEXT> into environment <NAME>
+  kubeenv <NEW_NAME>=<NAME>                  : rename environment <NAME> to <NEW_NAME>
+  kubeenv <NEW_NAME>=.                       : rename current environment to <NEW_NAME>
+  kubeenv -d <NAME> [<NAME>...]              : delete environment <NAME>
+
+  kubeenv -v, -vv, -vvv                      : set the verbosity level
+  kubeenv -h, --help                         : show this message
+EOF
+
+    exit 0
+}
+
+#######################################
+#           Helper Functions          #
+#######################################
+
+# Used to parse positional arguments provided to flags due to how the command usage is structured.
+getArgs() {
+    while [[ $# -gt 0 ]]; do
+        if [[ ! $1 =~ ^- ]]; then
+            echo "$1"
+        fi
+        shift
+    done
+}
+
+log() {
+    local msg=$1
+    local level=${2^^}
+    local level_num=$( echo "${LOG_LEVELS[@]}" | sed -r "s/.*${level} ([0-9]).*/\1/" )
+    local eff_level_num=$( echo "${LOG_LEVELS[@]}" | sed -r "s/.*${LOG_LEVEL} ([0-9]).*/\1/" )
+
+    if [[ ${level_num} -ge ${eff_level_num} ]]; then
+        if [[ ${level} == ERROR ]]; then
+            echo -e "Error: ${msg}" >&2
+        else
+            echo -e "${msg}" >&2
+        fi
+    fi
+
+    return ${TRUE}
+}
+
+setLogLevel() {
+    local level=$1
+
+    [[ ${level} =~ ${LOG_LEVEL_REGEX} ]] && LOG_LEVEL=${level} || return ${FALSE}
+
+    return ${TRUE}
+}
+
+setVerbosity() {
+    local verbosity=$1
+
+    # Set the log level accordingly.
+    [[ ${verbosity} == "-v" ]] && setLogLevel INFO
+    [[ ${verbosity} == "-vv" ]] && setLogLevel DEBUG
+    [[ ${verbosity} == "-vvv" ]] && setLogLevel TRACE
+
+    return ${TRUE}
+}
+
+init() {
+    local error=$( mktemp )
+
+    if ! mkdir -p ${KUBEENV_CONF_DIR} 2> ${error}; then
+        log "Failed to create directory \"${KUBEENV_CONF_DIR}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    return ${TRUE}
+}
+
+######################################
+#           Core Functions           #
+######################################
+
+renameEnv() {
+    local to_env=$1
+    local from_env=$2
+    local error=$( mktemp )
+
+    # Set the new environment name to KUBEENV if the current-environment identifier is specified.
+    if [[ ${from_env} == "." ]]; then
+        if [[ -n ${KUBEENV} ]]; then
+            from_env="${KUBEENV}"
+        else
+            log "No current environment set." ERROR
+            return ${FALSE}
+        fi
+    fi
+
+    # Verify the environment being renamed exists.
+    if [[ ! -f ${KUBEENV_CONF_DIR}/${from_env} ]]; then
+        log "No environment named \"${from_env}\" found." ERROR
+        return ${FALSE}
+    fi
+
+    # Verify the new environment name doesn't already exist.
+    if [[ -f ${KUBEENV_CONF_DIR}/${to_env} ]]; then
+        log "An environment already exists with name \"${to_env}\"." ERROR
+        return ${FALSE} 
+    fi
+
+    # Rename the environment.
+    log "Renaming environment \"${from_env}\" to \"${to_env}\"..." DEBUG
+    if ! mv ${KUBEENV_CONF_DIR}/${from_env} ${KUBEENV_CONF_DIR}/${to_env} 2> ${error}; then
+        log "Failed to renamed environment \"${from_env}\" to \"${to_env}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    return ${TRUE}
+}
+
+switchToEnv() {
+    local env=$1
+    local env_config="${KUBEENV_CONF_DIR}/${env}"
+
+    if [[ ! -f ${env_config} ]]; then
+        log "No Kubernetes environment found with name \"${env}\"." ERROR
+        return ${FALSE} 
+    fi
+
+    log "Environment config file: ${env_config}" DEBUG
+
+    export KUBEENV="${env}"
+    export KUBECONFIG="${env_config}"
+    if ! exec ${SHELL}; then
+        log "Failed to switch to the environment." ERROR
+        return ${FALSE}
+    fi
+
+    return ${TRUE}
+}
+
+deleteEnvs() {
+    local envs=( "$@" )
+    local env=
+    local env_config=
+    local error=$( mktemp )
+
+    for env in "${envs[@]}"; do
+        env_config="${KUBEENV_CONF_DIR}/${env}"
+
+        if [[ -f ${env_config} ]]; then
+            log "Deleting environment \"${env}\"..." DEBUG
+            if ! rm "${env_config}" 2> ${error}; then
+                log "Failed to delete environment configuration file: $(<${error})" ERROR
+                return ${FALSE}
+            fi
+        fi
+    done
+
+    return ${TRUE}
+}
+
+importContextToEnv() {
+    local env=$1
+    local context=$2
+    local kube_config=$3
+    local kube_config_json=
+    local env_config="${KUBEENV_CONF_DIR}/${env}"
+    local env_config_json=
+    local env_config_temp=
+    local context_config=
+    local context_cluster=
+    local context_user=
+    local cluster_config=
+    local user_config=
+    local error=$( mktemp )
+
+    [[ -z ${kube_config} ]] && kube_config="${HOME}/.kube/config"
+
+    # Convert the Kubernetes config to JSON so we can extract fields consistently. Unfortunately, yq and jq do not have fully compatible syntax.
+    if ! kube_config_json=$( yq -o json ${kube_config} 2> ${error} ); then
+        log "Failed to convert the Kubernetes configuration to JSON: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Create the configuration file for the desired environment if it doesn't already exist.
+    if [[ ! -f ${env_config} ]]; then
+        if ! touch "${env_config}" 2> ${error}; then
+            log "Failed to create the environment configuration file: $(<${error})" ERROR
+            return ${FALSE}
+        fi
+
+        # Add the root level fields to the environment configuration.
+        if ! env_config_temp=$( jq -r --arg context ${context} '{ apiVersion: .apiVersion, kind: .kind, preferences: .preferences, "current-context": $context, clusters: [] }' <<<"${kube_config_json}" 2> ${error} ); then
+            log "Failed to populate the root fields: $(<${error})" ERROR
+            return ${FALSE}
+        fi
+
+        # Update the environment configuration file.
+        if ! yq -P <<<"${env_config_temp}" > ${env_config} 2> ${error}; then
+            log "Failed to update the environment configuration file with root fields: $(<${error})" ERROR
+            return ${FALSE}
+        fi
+    fi
+
+    # Load the existing environment configuration as JSON.
+    if ! env_config_json=$( yq -o json ${env_config} 2> ${error} ); then
+        log "Failed to load the existing environment configuration: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    log "Environment configuration (existing):\n${env_config_json}" TRACE
+
+    # Extract the context configuration details for the provided context.
+    if ! context_config=$( jq -er --arg context ${context} '.contexts[] | select(.name == $context)' <<<"${kube_config_json}" 2> ${error} ); then
+        log "Failed to extract the context configuration details for context \"${context}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Get the cluster associated with the context.
+    if ! context_cluster=$( jq -er '.context.cluster' <<<"${context_config}" 2> ${error} ); then
+        log "Failed to get the cluster name for context \"${context}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Get the user associated with the context.
+    if ! context_user=$( jq -er '.context.user' <<<"${context_config}" 2> ${error} ); then
+        log "Failed to extract the context user name for context \"${context}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Extract the cluster configuration details for the provided context.
+    if ! cluster_config=$( jq -er --arg cluster ${context_cluster} '.clusters[] | select(.name == $cluster) | { name: .name, cluster: { "certificate-authority-data": .cluster."certificate-authority-data", server: .cluster.server } }' <<<"${kube_config_json}" 2> ${error} ); then
+        log "Failed to extract the cluster configuration details for context \"${context}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    log "Cluster configuration:\n${cluster_config}" TRACE
+
+    # Extract the user configuration details for the provided context.
+    if ! user_config=$( jq -er --arg user ${context_user} '.users[] | select(.name == $user)' <<<"${kube_config_json}" 2> ${error} ); then
+        log "Failed to extract the user configuration details for context \"${context}\": $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Add the user configuration to the existing environment configuration.
+    if ! env_config_temp=$( jq -r --argjson cluster "${cluster_config}" --argjson context "${context_config}" --argjson user "${user_config}" '.clusters += [ $cluster ] | .contexts += [ $context ] | .users += [ $user ]' <<<"${env_config_json}" 2> ${error} ); then
+        log "Failed to add the cluster, context and user details to the environment configuration: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    log "Environment configuration (pending):\n${env_config_temp}" TRACE
+
+    # Save the final configuration (converted back to YAML).
+    log "Updating the configuration file \"${env_config}\"..." DEBUG
+    if ! yq -P <<<"${env_config_temp}" > ${env_config} 2> ${error}; then
+        log "Failed to update the environment configuration: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    return ${TRUE}
+}
+
+importAllContexts() {
+    local kube_config=$1
+    local kube_config_json=
+    local context_names=
+    local context_name=
+    local error=$( mktemp )
+
+    [[ -z ${kube_config} ]] && kube_config="${HOME}/.kube/config"
+
+    # Convert the Kubernetes config to JSON so we can extract fields consistently. Unfortunately, yq and jq do not have fully compatible syntax.
+    if ! kube_config_json=$( yq -o json ${kube_config} 2> ${error} ); then
+        log "Failed to convert the Kubernetes configuration to JSON: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Extract the context names from the configuration file.
+    if ! context_names=$( jq -er '.contexts[] | .name' <<<"${kube_config_json}" 2> ${error} ); then
+        log "Failed to extract the context names from the configuration file: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    log "Context names:\n${context_names}" TRACE
+
+    # Import each context to an environment with the same name.
+    while read context_name; do
+        log "Importing context \"${context_name}\" to environment \"${context_name}\"..." DEBUG
+        if ! importContextToEnv ${context_name} ${context_name} ${kube_config}; then
+            log "Failed to import context \"${context_name}\"." ERROR
+        fi
+    done <<<"${context_names}"
+
+    return ${TRUE}
+}
+
+addEnvs() {
+    local envs=( "$@" )
+    local env=
+    local env_config=
+    local error=$( mktemp )
+
+    for env in "${envs[@]}"; do
+        env_config="${KUBEENV_CONF_DIR}/${env}"
+
+        if [[ -f ${env_config} ]]; then
+            log "Environment \"${env}\" already exists." WARN
+            return ${TRUE}
+        else
+            log "Creating environment \"${env}\"..." DEBUG
+            if ! touch "${env_config}" 2> ${error}; then
+                log "Failed to create the environment configuration file: $(<${error})" ERROR
+                return ${FALSE}
+            fi
+        fi
+    done
+
+    return ${TRUE}
+}
+
+showCurrentEnv() {
+    echo "${KUBEENV}"
+}
+
+showEnvs() {
+    local envs=
+    local env=
+    local highlight="\e[33;40m"
+    local reset="\e[0m"
+    local error=$( mktemp )
+
+    if ! envs=$( find ${KUBEENV_CONF_DIR} -maxdepth 1 -type f -exec basename {} \; 2> ${error} ); then
+        log "Failed to list environments: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    # Sort the environments alphabetically.
+    envs=$( sort <<<"${envs}" )
+
+    # List the environments and highlight the currently active one, if any.
+    for env in ${envs}; do
+        if [[ ${env} == ${KUBEENV} ]]; then
+            echo -e "${highlight}${env}${reset}"
+        else
+            echo "${env}"
+        fi 
+    done
+
+    return ${TRUE}
+}
+
+#############################
+#           Main            #
+#############################
+
+# Verify jq (JSON parser) is installed.
+if ! command -v jq > /dev/null 2>&1; then
+    log "The jq command is not installed." ERROR
+    exit 1
+fi
+
+# Verify yq (YAML parser) is installed.
+if ! command -v yq > /dev/null 2>&1; then
+    log "The yq command is not installed." ERROR
+    exit 1
+fi
+
+# Create the kubeenv config directory if it doesn't exist.
+if [[ ! -d ${KUBEENV_CONF_DIR} ]]; then
+    if ! init; then
+        log "Failed to initialize kubeenv." ERROR
+        exit 1
+    fi
+fi
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -c|--current) 
+            mode="showCurrentEnv"
+            ;;
+        -a)
+            mode="addEnvs"
+            args=( $( getArgs "${@:2}" ) )
+            shift ${#args[@]}
+            ;;
+        -i)
+            args=( $( getArgs "${@:2}" ) )
+            if [[ ${#args[@]} -eq 2 || ${#args[@]} -eq 3 ]]; then
+                mode="importContextToEnv"
+            elif [[ ${#args[@]} -le 1 ]]; then
+                mode="importAllContexts"
+            else
+                log "Unsupported argument: $1" ERROR
+                usage
+            fi
+
+            shift ${#args[@]}
+            ;;
+        -d)
+            mode="deleteEnvs"
+            args=( $( getArgs "${@:2}" ) )
+            shift ${#args[@]}
+            ;;
+        -v|-vv|-vvv)
+            verbosity=$1
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [[ $1 =~ ^[a-zA-Z0-9_\-]+$ ]]; then
+                mode="switchToEnv"
+                args=( "$1" )
+            elif [[ $1 =~ ^[a-zA-Z0-9_\-]+=([a-zA-Z0-9_\-]+|\.)$ ]]; then
+                mode="renameEnv"
+                args=()
+                args[1]=$( cut -f 1 -d = <<<"$1" )
+                args[2]=$( cut -f 2 -d = <<<"$1" )
+            else
+                log "Unsupported argument: $1" ERROR
+                usage
+            fi
+            ;;            
+    esac
+
+    shift
+done
+
+[[ -z ${mode} ]] && mode="showEnvs"
+[[ -n ${verbosity} ]] && setVerbosity ${verbosity}
+
+log "Mode: ${mode}" DEBUG
+
+case ${mode} in
+    showEnvs)            showEnvs;;
+    showCurrentEnv)      showCurrentEnv;;
+    addEnvs)             addEnvs "${args[@]}";;
+    importAllContexts)   importAllContexts "${args[@]}";;
+    importContextToEnv)  importContextToEnv "${args[@]}";;
+    deleteEnvs)          deleteEnvs "${args[@]}";;
+    switchToEnv)         switchToEnv "${args[@]}";;
+    renameEnv)           renameEnv "${args[@]}";;
+esac
