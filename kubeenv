@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Author: Ronald Silva
 # Description:
 #   Simulates virtual environments for kubectl by adding another level of abstraction / organization on top of Kubernetes contexts. Environments can contain multiple contexts.
 #   This is useful for cases where multiple environments are managed from a single host, compared to dedicated hosts for each environment where environment contexts would automatically be separated.   
