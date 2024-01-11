@@ -214,6 +214,12 @@ importContextToEnv() {
             return ${FALSE}
         fi
 
+        # Set the file permissions.
+        if ! chmod 0600 "${env_config}" 2> ${error}; then
+            log "Failed to update the permissions for the configuration file: $(<${error})" ERROR
+            return ${FALSE}
+        fi
+
         # Add the root level fields to the environment configuration.
         if ! env_config_temp=$( jq -r --arg context ${context} '{ apiVersion: .apiVersion, kind: .kind, preferences: .preferences, "current-context": $context, clusters: [] }' <<<"${kube_config_json}" 2> ${error} ); then
             log "Failed to populate the root fields: $(<${error})" ERROR
@@ -234,6 +240,19 @@ importContextToEnv() {
     fi
 
     log "Environment configuration (existing):\n${env_config_json}" TRACE
+
+    # Check if the context being added already exists. To re-import a context, it must be removed first.
+    if ! context_exists=$( jq -r --arg context ${context} 'if .contexts | length > 0 then .contexts[] | select(.name == $context) else "" end' <<<"${env_config_json}" 2> ${error} ); then
+        log "Failed to check if context already exists in environment: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    if [[ -n ${context_exists} ]]; then
+        log "Context \"${context}\" already exists in environment \"${env}\". Skipping import." INFO
+        return ${TRUE}
+    fi
+
+    log "Importing context \"${context_name}\" to environment \"${context_name}\"..." INFO
 
     # Extract the context configuration details for the provided context.
     if ! context_config=$( jq -er --arg context ${context} '.contexts[] | select(.name == $context)' <<<"${kube_config_json}" 2> ${error} ); then
@@ -310,7 +329,6 @@ importAllContexts() {
 
     # Import each context to an environment with the same name.
     while read context_name; do
-        log "Importing context \"${context_name}\" to environment \"${context_name}\"..." DEBUG
         if ! importContextToEnv ${context_name} ${context_name} ${kube_config}; then
             log "Failed to import context \"${context_name}\"." ERROR
         fi
@@ -332,7 +350,7 @@ addEnvs() {
             log "Environment \"${env}\" already exists." WARN
             return ${TRUE}
         else
-            log "Creating environment \"${env}\"..." DEBUG
+            log "Creating environment \"${env}\"..." INFO
             if ! touch "${env_config}" 2> ${error}; then
                 log "Failed to create the environment configuration file: $(<${error})" ERROR
                 return ${FALSE}
