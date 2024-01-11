@@ -214,6 +214,12 @@ importContextToEnv() {
             return ${FALSE}
         fi
 
+        # Set the file permissions correctly.
+        if ! chmod 0600 "${env_config}" 2> ${error}; then
+            log "Failed to update the permissions for the configuration file: $(<${error})" ERROR
+            return ${FALSE}
+        fi
+
         # Add the root level fields to the environment configuration.
         if ! env_config_temp=$( jq -r --arg context ${context} '{ apiVersion: .apiVersion, kind: .kind, preferences: .preferences, "current-context": $context, clusters: [] }' <<<"${kube_config_json}" 2> ${error} ); then
             log "Failed to populate the root fields: $(<${error})" ERROR
