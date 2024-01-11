@@ -239,8 +239,10 @@ importContextToEnv() {
         return ${FALSE}
     fi
 
-    # Skip context if already exists. To re-import a context, remove it from the environment first and try again.
-    if ! context_exists=$( jq -r --arg context ${context} '.contexts[] | select(.name == $context)' <<<"${env_config_json}" 2> ${error} ); then
+    log "Environment configuration (existing):\n${env_config_json}" TRACE
+
+    # Check if the context being added already exists. To re-import a context, it must be removed first.
+    if ! context_exists=$( jq -r --arg context ${context} 'if .contexts | length > 0 then .contexts[] | select(.name == $context) else "" end' <<<"${env_config_json}" 2> ${error} ); then
         log "Failed to check if context already exists in environment: $(<${error})" ERROR
         return ${FALSE}
     fi
@@ -251,8 +253,6 @@ importContextToEnv() {
     fi
 
     log "Importing context \"${context_name}\" to environment \"${context_name}\"..." INFO
-
-    log "Environment configuration (existing):\n${env_config_json}" TRACE
 
     # Extract the context configuration details for the provided context.
     if ! context_config=$( jq -er --arg context ${context} '.contexts[] | select(.name == $context)' <<<"${kube_config_json}" 2> ${error} ); then
