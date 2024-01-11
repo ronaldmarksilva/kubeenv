@@ -214,7 +214,7 @@ importContextToEnv() {
             return ${FALSE}
         fi
 
-        # Set the file permissions correctly.
+        # Set the file permissions.
         if ! chmod 0600 "${env_config}" 2> ${error}; then
             log "Failed to update the permissions for the configuration file: $(<${error})" ERROR
             return ${FALSE}
@@ -238,6 +238,19 @@ importContextToEnv() {
         log "Failed to load the existing environment configuration: $(<${error})" ERROR
         return ${FALSE}
     fi
+
+    # Skip context if already exists. To re-import a context, remove it from the environment first and try again.
+    if ! context_exists=$( jq -r --arg context ${context} '.contexts[] | select(.name == $context)' <<<"${env_config_json}" 2> ${error} ); then
+        log "Failed to check if context already exists in environment: $(<${error})" ERROR
+        return ${FALSE}
+    fi
+
+    if [[ -n ${context_exists} ]]; then
+        log "Context \"${context}\" already exists in environment \"${env}\". Skipping import." INFO
+        return ${TRUE}
+    fi
+
+    log "Importing context \"${context_name}\" to environment \"${context_name}\"..." INFO
 
     log "Environment configuration (existing):\n${env_config_json}" TRACE
 
@@ -316,7 +329,6 @@ importAllContexts() {
 
     # Import each context to an environment with the same name.
     while read context_name; do
-        log "Importing context \"${context_name}\" to environment \"${context_name}\"..." DEBUG
         if ! importContextToEnv ${context_name} ${context_name} ${kube_config}; then
             log "Failed to import context \"${context_name}\"." ERROR
         fi
@@ -338,7 +350,7 @@ addEnvs() {
             log "Environment \"${env}\" already exists." WARN
             return ${TRUE}
         else
-            log "Creating environment \"${env}\"..." DEBUG
+            log "Creating environment \"${env}\"..." INFO
             if ! touch "${env_config}" 2> ${error}; then
                 log "Failed to create the environment configuration file: $(<${error})" ERROR
                 return ${FALSE}
